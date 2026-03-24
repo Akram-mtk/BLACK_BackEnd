@@ -32,4 +32,5 @@ temp/
 
 
 
-uploads/
+uploads/*
+!uploads/.gitkeep
