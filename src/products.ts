@@ -23,7 +23,36 @@ async function deleteFile(filename: string): Promise<void> {
   }
 }
 
-// CREATE PRODUCT
+// Reusable SELECT fragment — keeps all GET queries consistent
+const PRODUCT_SELECT = `
+  SELECT
+    p.id,
+    p.name,
+    p.description,
+    p.price,
+    p.category_id,
+    c.name   AS category,
+    p.thumbnail,
+    p.created_at,
+    p.updated_at,
+    COALESCE(
+      json_agg(pi.image_url) FILTER (WHERE pi.id IS NOT NULL),
+      '[]'
+    ) AS images
+  FROM products p
+  LEFT JOIN categories c  ON p.category_id = c.id
+  LEFT JOIN product_images pi ON p.id = pi.product_id
+`
+
+function mapRow(r: any) {
+  return {
+    ...r,
+    thumbnail: toUrl(r.thumbnail),
+    images: (r.images as string[]).map(toUrl)
+  }
+}
+
+// ─── CREATE PRODUCT ───────────────────────────────────────────────────────────
 router.post(
   "/",
   authenticateToken,
@@ -32,7 +61,7 @@ router.post(
     { name: "images", maxCount: 10 }
   ]),
   async (req, res) => {
-    const { name, description, price, category } = req.body
+    const { name, description, price, category_id } = req.body
 
     const files = req.files as {
       thumbnail?: Express.Multer.File[]
@@ -47,10 +76,10 @@ router.post(
       await client.query("BEGIN")
 
       const product = await client.query(
-        `INSERT INTO products (name, description, price, category, thumbnail)
+        `INSERT INTO products (name, description, price, category_id, thumbnail)
          VALUES ($1,$2,$3,$4,$5)
          RETURNING id`,
-        [name, description, price, category, thumbnail]
+        [name, description, price, category_id ?? null, thumbnail]
       )
 
       const productId = product.rows[0].id
@@ -64,10 +93,9 @@ router.post(
       }
 
       await client.query("COMMIT")
-      res.json({ success: true, id: productId })
+      res.status(201).json({ success: true, id: productId })
     } catch (err) {
       await client.query("ROLLBACK")
-      // Clean up uploaded files if DB insert failed
       if (thumbnail) await deleteFile(thumbnail)
       for (const file of images) await deleteFile(file.filename)
       console.error("POST /products error:", err)
@@ -78,133 +106,63 @@ router.post(
   }
 )
 
-// GET ALL PRODUCTS
+// ─── GET ALL PRODUCTS ─────────────────────────────────────────────────────────
 router.get("/", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT
-        p.id,
-        p.name,
-        p.description,
-        p.price,
-        p.category,
-        p.thumbnail,
-        COALESCE(
-          json_agg(pi.image_url) FILTER (WHERE pi.id IS NOT NULL),
-          '[]'
-        ) AS images
-      FROM products p
-      LEFT JOIN product_images pi ON p.id = pi.product_id
-      GROUP BY p.id
+      ${PRODUCT_SELECT}
+      GROUP BY p.id, c.id
       ORDER BY p.id DESC
     `)
 
-    const rows = result.rows.map(r => ({
-      ...r,
-      thumbnail: toUrl(r.thumbnail),
-      images: (r.images as string[]).map(toUrl)
-    }))
-
-    res.json(rows)
+    res.json(result.rows.map(mapRow))
   } catch (err) {
     console.error("GET /products error:", err)
     res.status(500).json({ error: "Failed to fetch products" })
   }
 })
 
-// GET CATEGORIES
-router.get("/categories", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT DISTINCT category
-      FROM products
-      WHERE category IS NOT NULL
-      ORDER BY category
-    `)
-
-    res.json(result.rows.map(r => r.category))
-  } catch (err) {
-    console.error("GET /products/categories error:", err)
-    res.status(500).json({ error: "Failed to fetch categories" })
-  }
-})
-
-// GET PRODUCT BY ID
-router.get("/id/:id", async (req, res) => {
+// ─── GET PRODUCT BY ID ────────────────────────────────────────────────────────
+router.get("/:id", async (req, res) => {
   const { id } = req.params
 
   try {
     const result = await pool.query(`
-      SELECT
-        p.id,
-        p.name,
-        p.description,
-        p.price,
-        p.category,
-        p.thumbnail,
-        COALESCE(
-          json_agg(pi.image_url) FILTER (WHERE pi.id IS NOT NULL),
-          '[]'
-        ) AS images
-      FROM products p
-      LEFT JOIN product_images pi ON p.id = pi.product_id
+      ${PRODUCT_SELECT}
       WHERE p.id = $1
-      GROUP BY p.id
+      GROUP BY p.id, c.id
     `, [id])
 
     if (result.rows.length === 0)
       return res.status(404).json({ error: "Product not found" })
 
-    const row = result.rows[0]
-    res.json({
-      ...row,
-      thumbnail: toUrl(row.thumbnail),
-      images: (row.images as string[]).map(toUrl)
-    })
+    res.json(mapRow(result.rows[0]))
   } catch (err) {
-    console.error("GET /products/id/:id error:", err)
+    console.error("GET /products/:id error:", err)
     res.status(500).json({ error: "Failed to fetch product" })
   }
 })
 
-// GET PRODUCTS BY CATEGORY
-router.get("/category/:category", async (req, res) => {
-  const { category } = req.params
+// ─── GET PRODUCTS BY CATEGORY ─────────────────────────────────────────────────
+router.get("/category/:categoryId", async (req, res) => {
+  const { categoryId } = req.params
 
   try {
     const result = await pool.query(`
-      SELECT
-        p.id,
-        p.name,
-        p.description,
-        p.price,
-        p.category,
-        p.thumbnail,
-        COALESCE(
-          json_agg(pi.image_url) FILTER (WHERE pi.id IS NOT NULL),
-          '[]'
-        ) AS images
-      FROM products p
-      LEFT JOIN product_images pi ON p.id = pi.product_id
-      WHERE p.category = $1
-      GROUP BY p.id
+      ${PRODUCT_SELECT}
+      WHERE p.category_id = $1
+      GROUP BY p.id, c.id
       ORDER BY p.id DESC
-    `, [category])
+    `, [categoryId])
 
-    const rows = result.rows.map(r => ({
-      ...r,
-      thumbnail: toUrl(r.thumbnail),
-      images: (r.images as string[]).map(toUrl)
-    }))
-
-    res.json(rows)
+    res.json(result.rows.map(mapRow))
   } catch (err) {
-    console.error("GET /products/category/:category error:", err)
+    console.error("GET /products/category/:categoryId error:", err)
     res.status(500).json({ error: "Failed to fetch products" })
   }
 })
 
-// UPDATE PRODUCT
+// ─── UPDATE PRODUCT ───────────────────────────────────────────────────────────
 router.put(
   "/:id",
   authenticateToken,
@@ -214,7 +172,7 @@ router.put(
   ]),
   async (req, res) => {
     const { id } = req.params
-    const { name, description, price, category } = req.body
+    const { name, description, price, category_id } = req.body
 
     const files = req.files as {
       thumbnail?: Express.Multer.File[]
@@ -228,7 +186,6 @@ router.put(
     try {
       await client.query("BEGIN")
 
-      // Fetch old thumbnail before overwriting
       const existing = await client.query(
         `SELECT thumbnail FROM products WHERE id = $1`,
         [id]
@@ -245,10 +202,14 @@ router.put(
 
       await client.query(
         `UPDATE products
-         SET name=$1, description=$2, price=$3, category=$4,
-             thumbnail = COALESCE($5, thumbnail)
-         WHERE id=$6`,
-        [name, description, price, category, newThumbnail, id]
+         SET name        = $1,
+             description = $2,
+             price       = $3,
+             category_id = $4,
+             thumbnail   = COALESCE($5, thumbnail),
+             updated_at  = CURRENT_TIMESTAMP
+         WHERE id = $6`,
+        [name, description, price, category_id ?? null, newThumbnail, id]
       )
 
       for (const file of newImages) {
@@ -261,7 +222,6 @@ router.put(
 
       await client.query("COMMIT")
 
-      // Delete old thumbnail from disk only after successful DB update
       if (newThumbnail && oldThumbnail) await deleteFile(oldThumbnail)
 
       res.json({ success: true })
@@ -277,7 +237,7 @@ router.put(
   }
 )
 
-// DELETE PRODUCT
+// ─── DELETE PRODUCT ───────────────────────────────────────────────────────────
 router.delete("/:id", authenticateToken, async (req, res) => {
   const { id } = req.params
 
@@ -301,10 +261,10 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     )
 
     await client.query(`DELETE FROM products WHERE id = $1`, [id])
+    // product_images cascade-delete automatically
 
     await client.query("COMMIT")
 
-    // Delete files only after successful DB delete
     if (product.rows[0]?.thumbnail) await deleteFile(product.rows[0].thumbnail)
     for (const img of images.rows) await deleteFile(img.image_url)
 
@@ -318,7 +278,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
   }
 })
 
-// ADD EXTRA IMAGES
+// ─── ADD EXTRA IMAGES ─────────────────────────────────────────────────────────
 router.post(
   "/:id/images",
   authenticateToken,
@@ -331,7 +291,6 @@ router.post(
     try {
       await client.query("BEGIN")
 
-      // Verify product exists before inserting images
       const exists = await client.query(
         `SELECT id FROM products WHERE id = $1`,
         [id]
@@ -364,7 +323,7 @@ router.post(
   }
 )
 
-// DELETE IMAGE
+// ─── DELETE IMAGE ─────────────────────────────────────────────────────────────
 router.delete("/images/:id", authenticateToken, async (req, res) => {
   const { id } = req.params
 
@@ -386,7 +345,6 @@ router.delete("/images/:id", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT")
 
-    // Delete file only after successful DB delete
     await deleteFile(result.rows[0].image_url)
 
     res.json({ success: true })

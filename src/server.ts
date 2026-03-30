@@ -4,6 +4,8 @@ import dotenv from "dotenv"
 
 import authRoutes from "./auth"
 import productRoutes from "./products"
+import categoryRoutes from "./categories"
+import orderRoutes from "./orders"
 
 dotenv.config()
 
@@ -17,11 +19,8 @@ app.use("/uploads", express.static("uploads"))
 
 app.use("/auth", authRoutes)
 app.use("/products", productRoutes)
-
-
-app.get("/", (req, res) => {
-  res.send("Hello World")
-})
+app.use("/categories", categoryRoutes)
+app.use("/orders", orderRoutes)
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`)
