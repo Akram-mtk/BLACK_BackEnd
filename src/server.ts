@@ -8,16 +8,16 @@ import productRoutes from "./products"
 dotenv.config()
 
 const app = express()
-// app.use(cors({ origin: "https://yourdomain.com" }))
-app.use(cors())
+const PORT = Number(process.env.PORT) || 3000
+
+// Restrict to your front-end origin in production
+app.use(cors({ origin: process.env.CORS_ORIGIN || "*" }))
 app.use(express.json())
 app.use("/uploads", express.static("uploads"))
 
 app.use("/auth", authRoutes)
 app.use("/products", productRoutes)
 
-app.listen(3000, () => {
-  console.log("Server running on port 3000")
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`)
 })
-
-
