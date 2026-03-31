@@ -7,13 +7,13 @@ import { authenticateToken } from "./auth.middleware"
 
 const router = Router()
 
-// Safe helper: build full image URL without SQL interpolation
+// ─── HELPERS ──────────────────────────────────────────────────────────────────
+
 function toUrl(filename: string | null): string | null {
   if (!filename) return null
   return `${process.env.BASE_IMAGE_URL}${filename}`
 }
 
-// Safe helper: delete a file from disk (non-throwing)
 async function deleteFile(filename: string): Promise<void> {
   try {
     const filePath = path.join("uploads", path.basename(filename))
@@ -23,7 +23,6 @@ async function deleteFile(filename: string): Promise<void> {
   }
 }
 
-// Reusable SELECT fragment — keeps all GET queries consistent
 const PRODUCT_SELECT = `
   SELECT
     p.id,
@@ -63,6 +62,9 @@ router.post(
   async (req, res) => {
     const { name, description, price, category_id } = req.body
 
+    if (!name || price === undefined)
+      return res.status(400).json({ error: "name and price are required" })
+
     const files = req.files as {
       thumbnail?: Express.Multer.File[]
       images?: Express.Multer.File[]
@@ -79,15 +81,14 @@ router.post(
         `INSERT INTO products (name, description, price, category_id, thumbnail)
          VALUES ($1,$2,$3,$4,$5)
          RETURNING id`,
-        [name, description, price, category_id ?? null, thumbnail]
+        [name, description ?? null, price, category_id ?? null, thumbnail]
       )
 
       const productId = product.rows[0].id
 
       for (const file of images) {
         await client.query(
-          `INSERT INTO product_images (product_id, image_url)
-           VALUES ($1,$2)`,
+          `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
           [productId, file.filename]
         )
       }
@@ -122,6 +123,25 @@ router.get("/", async (req, res) => {
   }
 })
 
+// ─── GET PRODUCTS BY CATEGORY ─────────────────────────────────────────────────
+router.get("/category/:categoryId", async (req, res) => {
+  const { categoryId } = req.params
+
+  try {
+    const result = await pool.query(`
+      ${PRODUCT_SELECT}
+      WHERE p.category_id = $1
+      GROUP BY p.id, c.id
+      ORDER BY p.id DESC
+    `, [categoryId])
+
+    res.json(result.rows.map(mapRow))
+  } catch (err) {
+    console.error("GET /products/category/:categoryId error:", err)
+    res.status(500).json({ error: "Failed to fetch products" })
+  }
+})
+
 // ─── GET PRODUCT BY ID ────────────────────────────────────────────────────────
 router.get("/:id", async (req, res) => {
   const { id } = req.params
@@ -143,27 +163,10 @@ router.get("/:id", async (req, res) => {
   }
 })
 
-// ─── GET PRODUCTS BY CATEGORY ─────────────────────────────────────────────────
-router.get("/category/:categoryId", async (req, res) => {
-  const { categoryId } = req.params
-
-  try {
-    const result = await pool.query(`
-      ${PRODUCT_SELECT}
-      WHERE p.category_id = $1
-      GROUP BY p.id, c.id
-      ORDER BY p.id DESC
-    `, [categoryId])
-
-    res.json(result.rows.map(mapRow))
-  } catch (err) {
-    console.error("GET /products/category/:categoryId error:", err)
-    res.status(500).json({ error: "Failed to fetch products" })
-  }
-})
-
-// ─── UPDATE PRODUCT ───────────────────────────────────────────────────────────
-router.put(
+// ─── UPDATE PRODUCT (partial) ─────────────────────────────────────────────────
+// Only the fields you send will be updated. Omitted fields keep their current value.
+// To clear category_id, send category_id: null explicitly.
+router.patch(
   "/:id",
   authenticateToken,
   upload.fields([
@@ -181,6 +184,43 @@ router.put(
 
     const newThumbnail = files.thumbnail?.[0]?.filename ?? null
     const newImages = files.images ?? []
+
+    // Build SET clause dynamically from only the provided fields
+    const setClauses: string[] = []
+    const values: any[] = []
+
+    if (name !== undefined) {
+      values.push(name)
+      setClauses.push(`name = $${values.length}`)
+    }
+    if (description !== undefined) {
+      values.push(description)
+      setClauses.push(`description = $${values.length}`)
+    }
+    if (price !== undefined) {
+      values.push(price)
+      setClauses.push(`price = $${values.length}`)
+    }
+    if (category_id !== undefined) {
+      // Allows setting to null to clear the category
+      values.push(category_id === "" ? null : category_id)
+      setClauses.push(`category_id = $${values.length}`)
+    }
+    if (newThumbnail) {
+      values.push(newThumbnail)
+      setClauses.push(`thumbnail = $${values.length}`)
+    }
+
+    // Always bump updated_at
+    setClauses.push(`updated_at = CURRENT_TIMESTAMP`)
+
+    if (setClauses.length === 1 && newImages.length === 0) {
+      // Only updated_at would change and no new images — nothing to do
+      return res.status(400).json({ error: "No fields provided to update" })
+    }
+
+    values.push(id) // last placeholder = WHERE id = $N
+    const whereIndex = values.length
 
     const client = await pool.connect()
     try {
@@ -201,27 +241,20 @@ router.put(
       const oldThumbnail = existing.rows[0].thumbnail
 
       await client.query(
-        `UPDATE products
-         SET name        = $1,
-             description = $2,
-             price       = $3,
-             category_id = $4,
-             thumbnail   = COALESCE($5, thumbnail),
-             updated_at  = CURRENT_TIMESTAMP
-         WHERE id = $6`,
-        [name, description, price, category_id ?? null, newThumbnail, id]
+        `UPDATE products SET ${setClauses.join(", ")} WHERE id = $${whereIndex}`,
+        values
       )
 
       for (const file of newImages) {
         await client.query(
-          `INSERT INTO product_images (product_id, image_url)
-           VALUES ($1,$2)`,
+          `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
           [id, file.filename]
         )
       }
 
       await client.query("COMMIT")
 
+      // Delete the old thumbnail from disk only after a successful commit
       if (newThumbnail && oldThumbnail) await deleteFile(oldThumbnail)
 
       res.json({ success: true })
@@ -229,7 +262,7 @@ router.put(
       await client.query("ROLLBACK")
       if (newThumbnail) await deleteFile(newThumbnail)
       for (const f of newImages) await deleteFile(f.filename)
-      console.error("PUT /products/:id error:", err)
+      console.error("PATCH /products/:id error:", err)
       res.status(500).json({ error: "Failed to update product" })
     } finally {
       client.release()
