@@ -4,7 +4,7 @@
     "outDir": "./dist",
 
     "module": "commonjs",
-    "moduleResolution": "bundler",
+    "moduleResolution": "node",
     "target": "ES2020",
 
     "types": ["node"],
