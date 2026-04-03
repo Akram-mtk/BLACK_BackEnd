@@ -1,26 +1,16 @@
 import { Router } from "express"
 import pool from "./db"
 import { upload } from "./multer.config"
-import fs from "fs/promises"
-import path from "path"
+import { uploadFile, deleteFile } from "./storage"
 import { authenticateToken } from "./auth.middleware"
 
 const router = Router()
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
-function toUrl(filename: string | null): string | null {
-  if (!filename) return null
-  return `${process.env.BASE_IMAGE_URL}${filename}`
-}
-
-async function deleteFile(filename: string): Promise<void> {
-  try {
-    const filePath = path.join("uploads", path.basename(filename))
-    await fs.unlink(filePath)
-  } catch {
-    // File missing or already deleted — not a fatal error
-  }
+function toUrl(key: string | null): string | null {
+  if (!key) return null
+  return `${process.env.SUPABASE_URL}/storage/v1/object/public/${process.env.SUPABASE_BUCKET}/${key}`
 }
 
 const PRODUCT_SELECT = `
@@ -47,8 +37,22 @@ function mapRow(r: any) {
   return {
     ...r,
     thumbnail: toUrl(r.thumbnail),
-    images: (r.images as string[]).map(toUrl)
+    images: (r.images as string[]).map(toUrl),
   }
+}
+
+// Upload a batch of multer files, returns their keys.
+// Cleans up any successful uploads if one fails mid-batch.
+async function uploadAll(files: Express.Multer.File[]): Promise<string[]> {
+  const keys: string[] = []
+  try {
+    for (const f of files)
+      keys.push(await uploadFile(f.buffer, f.originalname, f.mimetype))
+  } catch (err) {
+    for (const k of keys) await deleteFile(k)
+    throw err
+  }
+  return keys
 }
 
 // ─── CREATE PRODUCT ───────────────────────────────────────────────────────────
@@ -57,7 +61,7 @@ router.post(
   authenticateToken,
   upload.fields([
     { name: "thumbnail", maxCount: 1 },
-    { name: "images", maxCount: 10 }
+    { name: "images", maxCount: 10 },
   ]),
   async (req, res) => {
     const { name, description, price, category_id } = req.body
@@ -70,8 +74,19 @@ router.post(
       images?: Express.Multer.File[]
     }
 
-    const thumbnail = files.thumbnail?.[0]?.filename ?? null
-    const images = files.images ?? []
+    // Upload to Supabase before touching the DB
+    let thumbnailKey: string | null = null
+    let imageKeys: string[] = []
+
+    try {
+      if (files.thumbnail?.[0])
+        thumbnailKey = (await uploadAll([files.thumbnail[0]]))[0]
+      if (files.images?.length)
+        imageKeys = await uploadAll(files.images)
+    } catch (err) {
+      console.error("POST /products upload error:", err)
+      return res.status(500).json({ error: "Failed to upload images" })
+    }
 
     const client = await pool.connect()
     try {
@@ -81,15 +96,15 @@ router.post(
         `INSERT INTO products (name, description, price, category_id, thumbnail)
          VALUES ($1,$2,$3,$4,$5)
          RETURNING id`,
-        [name, description ?? null, price, category_id ?? null, thumbnail]
+        [name, description ?? null, price, category_id ?? null, thumbnailKey]
       )
 
       const productId = product.rows[0].id
 
-      for (const file of images) {
+      for (const key of imageKeys) {
         await client.query(
           `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
-          [productId, file.filename]
+          [productId, key]
         )
       }
 
@@ -97,9 +112,10 @@ router.post(
       res.status(201).json({ success: true, id: productId })
     } catch (err) {
       await client.query("ROLLBACK")
-      if (thumbnail) await deleteFile(thumbnail)
-      for (const file of images) await deleteFile(file.filename)
-      console.error("POST /products error:", err)
+      // DB failed — remove the files we just uploaded
+      if (thumbnailKey) await deleteFile(thumbnailKey)
+      for (const k of imageKeys) await deleteFile(k)
+      console.error("POST /products DB error:", err)
       res.status(500).json({ error: "Failed to create product" })
     } finally {
       client.release()
@@ -171,7 +187,7 @@ router.patch(
   authenticateToken,
   upload.fields([
     { name: "thumbnail", maxCount: 1 },
-    { name: "images", maxCount: 10 }
+    { name: "images", maxCount: 10 },
   ]),
   async (req, res) => {
     const { id } = req.params
@@ -182,8 +198,19 @@ router.patch(
       images?: Express.Multer.File[]
     }
 
-    const newThumbnail = files.thumbnail?.[0]?.filename ?? null
-    const newImages = files.images ?? []
+    // Upload new files to Supabase before touching the DB
+    let newThumbnailKey: string | null = null
+    let newImageKeys: string[] = []
+
+    try {
+      if (files.thumbnail?.[0])
+        newThumbnailKey = (await uploadAll([files.thumbnail[0]]))[0]
+      if (files.images?.length)
+        newImageKeys = await uploadAll(files.images)
+    } catch (err) {
+      console.error("PATCH /products/:id upload error:", err)
+      return res.status(500).json({ error: "Failed to upload images" })
+    }
 
     // Build SET clause dynamically from only the provided fields
     const setClauses: string[] = []
@@ -202,24 +229,21 @@ router.patch(
       setClauses.push(`price = $${values.length}`)
     }
     if (category_id !== undefined) {
-      // Allows setting to null to clear the category
       values.push(category_id === "" ? null : category_id)
       setClauses.push(`category_id = $${values.length}`)
     }
-    if (newThumbnail) {
-      values.push(newThumbnail)
+    if (newThumbnailKey) {
+      values.push(newThumbnailKey)
       setClauses.push(`thumbnail = $${values.length}`)
     }
 
     // Always bump updated_at
     setClauses.push(`updated_at = CURRENT_TIMESTAMP`)
 
-    if (setClauses.length === 1 && newImages.length === 0) {
-      // Only updated_at would change and no new images — nothing to do
+    if (setClauses.length === 1 && newImageKeys.length === 0)
       return res.status(400).json({ error: "No fields provided to update" })
-    }
 
-    values.push(id) // last placeholder = WHERE id = $N
+    values.push(id)
     const whereIndex = values.length
 
     const client = await pool.connect()
@@ -233,36 +257,36 @@ router.patch(
 
       if (existing.rows.length === 0) {
         await client.query("ROLLBACK")
-        if (newThumbnail) await deleteFile(newThumbnail)
-        for (const f of newImages) await deleteFile(f.filename)
+        if (newThumbnailKey) await deleteFile(newThumbnailKey)
+        for (const k of newImageKeys) await deleteFile(k)
         return res.status(404).json({ error: "Product not found" })
       }
 
-      const oldThumbnail = existing.rows[0].thumbnail
+      const oldThumbnailKey = existing.rows[0].thumbnail
 
       await client.query(
         `UPDATE products SET ${setClauses.join(", ")} WHERE id = $${whereIndex}`,
         values
       )
 
-      for (const file of newImages) {
+      for (const key of newImageKeys) {
         await client.query(
           `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
-          [id, file.filename]
+          [id, key]
         )
       }
 
       await client.query("COMMIT")
 
-      // Delete the old thumbnail from disk only after a successful commit
-      if (newThumbnail && oldThumbnail) await deleteFile(oldThumbnail)
+      // Delete old thumbnail from Supabase only after successful DB commit
+      if (newThumbnailKey && oldThumbnailKey) await deleteFile(oldThumbnailKey)
 
       res.json({ success: true })
     } catch (err) {
       await client.query("ROLLBACK")
-      if (newThumbnail) await deleteFile(newThumbnail)
-      for (const f of newImages) await deleteFile(f.filename)
-      console.error("PATCH /products/:id error:", err)
+      if (newThumbnailKey) await deleteFile(newThumbnailKey)
+      for (const k of newImageKeys) await deleteFile(k)
+      console.error("PATCH /products/:id DB error:", err)
       res.status(500).json({ error: "Failed to update product" })
     } finally {
       client.release()
@@ -298,6 +322,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT")
 
+    // Delete from Supabase only after successful DB delete
     if (product.rows[0]?.thumbnail) await deleteFile(product.rows[0].thumbnail)
     for (const img of images.rows) await deleteFile(img.image_url)
 
@@ -320,6 +345,15 @@ router.post(
     const { id } = req.params
     const files = req.files as Express.Multer.File[]
 
+    let uploadedKeys: string[] = []
+
+    try {
+      uploadedKeys = await uploadAll(files)
+    } catch (err) {
+      console.error("POST /products/:id/images upload error:", err)
+      return res.status(500).json({ error: "Failed to upload images" })
+    }
+
     const client = await pool.connect()
     try {
       await client.query("BEGIN")
@@ -331,15 +365,14 @@ router.post(
 
       if (exists.rows.length === 0) {
         await client.query("ROLLBACK")
-        for (const f of files) await deleteFile(f.filename)
+        for (const k of uploadedKeys) await deleteFile(k)
         return res.status(404).json({ error: "Product not found" })
       }
 
-      for (const file of files) {
+      for (const key of uploadedKeys) {
         await client.query(
-          `INSERT INTO product_images (product_id, image_url)
-           VALUES ($1,$2)`,
-          [id, file.filename]
+          `INSERT INTO product_images (product_id, image_url) VALUES ($1,$2)`,
+          [id, key]
         )
       }
 
@@ -347,8 +380,8 @@ router.post(
       res.json({ success: true })
     } catch (err) {
       await client.query("ROLLBACK")
-      for (const f of files) await deleteFile(f.filename)
-      console.error("POST /products/:id/images error:", err)
+      for (const k of uploadedKeys) await deleteFile(k)
+      console.error("POST /products/:id/images DB error:", err)
       res.status(500).json({ error: "Failed to add images" })
     } finally {
       client.release()
@@ -378,6 +411,7 @@ router.delete("/images/:id", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT")
 
+    // Delete from Supabase only after successful DB delete
     await deleteFile(result.rows[0].image_url)
 
     res.json({ success: true })

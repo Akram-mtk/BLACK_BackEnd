@@ -1,26 +1,11 @@
 import multer from "multer"
-import path from "path"
-import crypto from "crypto"
 
 const ALLOWED_TYPES = ["image/jpeg", "image/png", "image/webp"]
 const MAX_SIZE_BYTES = 5 * 1024 * 1024 // 5 MB
 
-const storage = multer.diskStorage({
-
-  destination: (req, file, cb) => {
-    cb(null, "uploads/")
-  },
-
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase()
-    const random = crypto.randomBytes(16).toString("hex")
-    cb(null, `${Date.now()}-${random}${ext}`)
-  }
-
-})
-
+// Memory storage — buffers go directly to Supabase, nothing written to disk
 export const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: MAX_SIZE_BYTES },
   fileFilter: (req, file, cb) => {
     if (ALLOWED_TYPES.includes(file.mimetype)) {
@@ -28,5 +13,5 @@ export const upload = multer({
     } else {
       cb(new Error(`Invalid file type. Allowed: ${ALLOWED_TYPES.join(", ")}`))
     }
-  }
+  },
 })
