@@ -31,6 +31,7 @@ const PRODUCT_SELECT = `
   FROM products p
   LEFT JOIN categories c  ON p.category_id = c.id
   LEFT JOIN product_images pi ON p.id = pi.product_id
+  WHERE p.is_active = TRUE
 `
 
 function mapRow(r: any) {
@@ -74,7 +75,6 @@ router.post(
       images?: Express.Multer.File[]
     }
 
-    // Upload to Supabase before touching the DB
     let thumbnailKey: string | null = null
     let imageKeys: string[] = []
 
@@ -112,7 +112,6 @@ router.post(
       res.status(201).json({ success: true, id: productId })
     } catch (err) {
       await client.query("ROLLBACK")
-      // DB failed — remove the files we just uploaded
       if (thumbnailKey) await deleteFile(thumbnailKey)
       for (const k of imageKeys) await deleteFile(k)
       console.error("POST /products DB error:", err)
@@ -146,7 +145,7 @@ router.get("/category/:categoryId", async (req, res) => {
   try {
     const result = await pool.query(`
       ${PRODUCT_SELECT}
-      WHERE p.category_id = $1
+      AND p.category_id = $1
       GROUP BY p.id, c.id
       ORDER BY p.id DESC
     `, [categoryId])
@@ -165,7 +164,7 @@ router.get("/:id", async (req, res) => {
   try {
     const result = await pool.query(`
       ${PRODUCT_SELECT}
-      WHERE p.id = $1
+      AND p.id = $1
       GROUP BY p.id, c.id
     `, [id])
 
@@ -198,7 +197,6 @@ router.patch(
       images?: Express.Multer.File[]
     }
 
-    // Upload new files to Supabase before touching the DB
     let newThumbnailKey: string | null = null
     let newImageKeys: string[] = []
 
@@ -212,7 +210,6 @@ router.patch(
       return res.status(500).json({ error: "Failed to upload images" })
     }
 
-    // Build SET clause dynamically from only the provided fields
     const setClauses: string[] = []
     const values: any[] = []
 
@@ -237,7 +234,6 @@ router.patch(
       setClauses.push(`thumbnail = $${values.length}`)
     }
 
-    // Always bump updated_at
     setClauses.push(`updated_at = CURRENT_TIMESTAMP`)
 
     if (setClauses.length === 1 && newImageKeys.length === 0)
@@ -250,8 +246,9 @@ router.patch(
     try {
       await client.query("BEGIN")
 
+      // Only allow updating active products
       const existing = await client.query(
-        `SELECT thumbnail FROM products WHERE id = $1`,
+        `SELECT thumbnail FROM products WHERE id = $1 AND is_active = TRUE`,
         [id]
       )
 
@@ -278,7 +275,6 @@ router.patch(
 
       await client.query("COMMIT")
 
-      // Delete old thumbnail from Supabase only after successful DB commit
       if (newThumbnailKey && oldThumbnailKey) await deleteFile(oldThumbnailKey)
 
       res.json({ success: true })
@@ -294,7 +290,9 @@ router.patch(
   }
 )
 
-// ─── DELETE PRODUCT ───────────────────────────────────────────────────────────
+// ─── DEACTIVATE PRODUCT (soft-delete) ────────────────────────────────────────
+// Sets is_active = FALSE and deletes all images from Supabase storage.
+// The row stays in the DB so order_items FK references are preserved.
 router.delete("/:id", authenticateToken, async (req, res) => {
   const { id } = req.params
 
@@ -303,7 +301,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
     await client.query("BEGIN")
 
     const product = await client.query(
-      `SELECT thumbnail FROM products WHERE id = $1`,
+      `SELECT thumbnail FROM products WHERE id = $1 AND is_active = TRUE`,
       [id]
     )
 
@@ -312,17 +310,31 @@ router.delete("/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ error: "Product not found" })
     }
 
+    // Collect all extra image keys before deleting their rows
     const images = await client.query(
       `SELECT image_url FROM product_images WHERE product_id = $1`,
       [id]
     )
 
-    await client.query(`DELETE FROM products WHERE id = $1`, [id])
-    // product_images cascade-delete automatically
+    // Remove all product_images rows
+    await client.query(
+      `DELETE FROM product_images WHERE product_id = $1`,
+      [id]
+    )
+
+    // Soft-delete: mark inactive and clear image fields
+    await client.query(
+      `UPDATE products
+       SET is_active  = FALSE,
+           thumbnail  = NULL,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE id = $1`,
+      [id]
+    )
 
     await client.query("COMMIT")
 
-    // Delete from Supabase only after successful DB delete
+    // Delete from Supabase only after successful DB commit
     if (product.rows[0]?.thumbnail) await deleteFile(product.rows[0].thumbnail)
     for (const img of images.rows) await deleteFile(img.image_url)
 
@@ -330,7 +342,7 @@ router.delete("/:id", authenticateToken, async (req, res) => {
   } catch (err) {
     await client.query("ROLLBACK")
     console.error("DELETE /products/:id error:", err)
-    res.status(500).json({ error: "Failed to delete product" })
+    res.status(500).json({ error: "Failed to deactivate product" })
   } finally {
     client.release()
   }
@@ -358,8 +370,9 @@ router.post(
     try {
       await client.query("BEGIN")
 
+      // Only allow adding images to active products
       const exists = await client.query(
-        `SELECT id FROM products WHERE id = $1`,
+        `SELECT id FROM products WHERE id = $1 AND is_active = TRUE`,
         [id]
       )
 
@@ -411,7 +424,6 @@ router.delete("/images/:id", authenticateToken, async (req, res) => {
 
     await client.query("COMMIT")
 
-    // Delete from Supabase only after successful DB delete
     await deleteFile(result.rows[0].image_url)
 
     res.json({ success: true })
